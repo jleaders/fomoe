@@ -5166,21 +5166,28 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
     ctx->d_cpu_partial = nullptr;
     ctx->cpu_expert = nullptr;
     {
-        hipError_t e1 = hipHostMalloc(&ctx->h_norm, ctx->n_embd * sizeof(float), hipHostMallocDefault);
-        hipError_t e2 = hipHostMalloc(&ctx->h_cpu_partial, ctx->n_embd * sizeof(float), hipHostMallocDefault);
-        hipError_t e3 = hipMalloc(&ctx->d_cpu_partial, ctx->n_embd * sizeof(float));
-        if (e1 == hipSuccess && e2 == hipSuccess && e3 == hipSuccess) {
-            ctx->cpu_expert = cpu_expert_create(ctx->n_embd, ctx->expert_intermediate);
-            if (ctx->cpu_expert)
-                fprintf(stderr, "GPU: CPU expert compute enabled (n_embd=%d, inter=%d)\n",
-                        ctx->n_embd, ctx->expert_intermediate);
-            else
-                fprintf(stderr, "GPU: WARNING: cpu_expert_create failed\n");
-        } else {
-            fprintf(stderr, "GPU: WARNING: CPU expert buffer alloc failed\n");
-            if (ctx->h_norm) { hipHostFree(ctx->h_norm); ctx->h_norm = nullptr; }
-            if (ctx->h_cpu_partial) { hipHostFree(ctx->h_cpu_partial); ctx->h_cpu_partial = nullptr; }
-            if (ctx->d_cpu_partial) { hipFree(ctx->d_cpu_partial); ctx->d_cpu_partial = nullptr; }
+        const char *cpu_thr_env = getenv("QMOE_CPU_THRESHOLD");
+        int cpu_threshold = cpu_thr_env ? atoi(cpu_thr_env) : 0;
+        bool need_host_norm = (ctx->n_devices > 1) || (cpu_threshold > 0);
+        if (need_host_norm) {
+            hipError_t e1 = hipHostMalloc(&ctx->h_norm, ctx->n_embd * sizeof(float), hipHostMallocDefault);
+            hipError_t e2 = hipHostMalloc(&ctx->h_cpu_partial, ctx->n_embd * sizeof(float), hipHostMallocDefault);
+            hipError_t e3 = hipMalloc(&ctx->d_cpu_partial, ctx->n_embd * sizeof(float));
+            if (e1 == hipSuccess && e2 == hipSuccess && e3 == hipSuccess) {
+                if (cpu_threshold > 0) {
+                    ctx->cpu_expert = cpu_expert_create(ctx->n_embd, ctx->expert_intermediate);
+                    if (ctx->cpu_expert)
+                        fprintf(stderr, "GPU: CPU expert compute enabled (n_embd=%d, inter=%d)\n",
+                                ctx->n_embd, ctx->expert_intermediate);
+                    else
+                        fprintf(stderr, "GPU: WARNING: cpu_expert_create failed\n");
+                }
+            } else {
+                fprintf(stderr, "GPU: WARNING: CPU expert buffer alloc failed\n");
+                if (ctx->h_norm) { hipHostFree(ctx->h_norm); ctx->h_norm = nullptr; }
+                if (ctx->h_cpu_partial) { hipHostFree(ctx->h_cpu_partial); ctx->h_cpu_partial = nullptr; }
+                if (ctx->d_cpu_partial) { hipFree(ctx->d_cpu_partial); ctx->d_cpu_partial = nullptr; }
+            }
         }
     }
 
@@ -5514,24 +5521,32 @@ static void queue_attn_and_router(gpu_ctx_t *ctx, int il, int kv_idx, int ssm_id
     dispatch_matvec(s, gl->d_router, GGML_TYPE_F32_ID, ctx->d_norm,
                     ctx->d_router_out, ctx->n_experts_total, n_embd);
 
-    // GPU softmax + top-k + D2H
+    // GPU softmax + top-k
     kernel_softmax<<<1, 256, 0, s>>>(ctx->d_router_out, ctx->n_experts_total);
-    // D2H full softmax scores for cache-aware routing (1-2 KB)
-    (void)hipMemcpyAsync(ctx->h_all_scores, ctx->d_router_out,
-                          ctx->n_experts_total * sizeof(float), hipMemcpyDeviceToHost, s);
     kernel_top_k_parallel<<<1, 32, 0, s>>>(
         ctx->d_router_out, ctx->n_experts_total, ctx->n_experts_used,
         ctx->d_top_k_ids, ctx->d_top_k_vals);
+
+    // Route tiny D2H copies through transfer_stream after the router kernels complete.
+    // This avoids queueing them behind compute work on the main stream while keeping
+    // e[4] as the "router + D2H done" sync point for the CPU classification path.
+    hipStream_t ts = ctx->transfer_stream;
+    hipEventRecord(ctx->spec2_event, s);
+    (void)hipStreamWaitEvent(ts, ctx->spec2_event, 0);
+
+    // D2H full softmax scores for cache-aware routing (1-2 KB)
+    (void)hipMemcpyAsync(ctx->h_all_scores, ctx->d_router_out,
+                          ctx->n_experts_total * sizeof(float), hipMemcpyDeviceToHost, ts);
     (void)hipMemcpyAsync(ctx->h_top_k_ids, ctx->d_top_k_ids,
-                          ctx->n_experts_used * sizeof(int), hipMemcpyDeviceToHost, s);
+                          ctx->n_experts_used * sizeof(int), hipMemcpyDeviceToHost, ts);
     (void)hipMemcpyAsync(ctx->h_top_k_vals, ctx->d_top_k_vals,
-                          ctx->n_experts_used * sizeof(float), hipMemcpyDeviceToHost, s);
+                          ctx->n_experts_used * sizeof(float), hipMemcpyDeviceToHost, ts);
     // D2H hidden state for CPU expert compute (16 KB — negligible DMA cost)
-    if (ctx->h_norm) {
+    if (ctx->h_norm && (ctx->cpu_expert != nullptr || ctx->n_devices > 1)) {
         (void)hipMemcpyAsync(ctx->h_norm, ctx->d_norm,
-                              ctx->n_embd * sizeof(float), hipMemcpyDeviceToHost, s);
+                              ctx->n_embd * sizeof(float), hipMemcpyDeviceToHost, ts);
     }
-    hipEventRecord(ctx->prof.e[4], s);
+    hipEventRecord(ctx->prof.e[4], ts);
 
     // SharedFFN: queue on compute stream to fill GPU idle time during CPU sync.
     // SharedFFN depends only on d_norm (set by router norm above) + shared weights.
@@ -7439,8 +7454,8 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
         // --- PASS 2: Late prefetch consumption (NVMe may have completed during Phase 1) ---
         // Gives ~0.6ms more overlap time for stragglers to arrive.
         if (ctx->pf_pending) {
-            consume_prefetch_nvme(ctx);  // try once more
-            ctx->pf_pending = false;     // give up if still not done
+            if (consume_prefetch_nvme(ctx))
+                ctx->pf_pending = false;
         }
 
         // === SPECULATIVE ROUTING: predict next layer's experts during NVMe wait ===
@@ -7572,6 +7587,14 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
             nvme_bg_active = true;
         }
 
+        // Start coalesced RAM-hit gather as early as possible so the host memcpy work
+        // overlaps the double-buffer wait and NVMe background setup.
+        bool bounce_started = false;
+        if (!use_cpu_experts && n_ramhit > 0 && ctx->h2d_bounce && ctx->bounce_worker.active) {
+            bounce_worker_start(ctx, ramhit_slot, n_ramhit);
+            bounce_started = true;
+        }
+
         // Step 2: Double-buffer wait (ensures staging buffer from 2 layers ago is free)
         clock_gettime(CLOCK_MONOTONIC, &sp_t1);
         ctx->prof.classify_ms += (sp_t1.tv_sec - sp_t0.tv_sec) * 1000.0 +
@@ -7587,7 +7610,9 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
             // Coalesced: gather into contiguous bounce buffer, then single large H2D transfer.
             // One large DMA gets much closer to PCIe peak bandwidth than N small ones.
             if (n_ramhit > 0 && ctx->h2d_bounce) {
-                if (ctx->bounce_worker.active) {
+                if (bounce_started) {
+                    bounce_worker_wait(ctx);
+                } else if (ctx->bounce_worker.active) {
                     bounce_worker_start(ctx, ramhit_slot, n_ramhit);
                     bounce_worker_wait(ctx);
                 } else {
